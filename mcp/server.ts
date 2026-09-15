@@ -122,7 +122,21 @@ let jwks: ReturnType<typeof createRemoteJWKSet> | null = null;
 
 function getJwks() {
     if (!jwks) {
-        const baseUrl = (process.env.NEXT_PUBLIC_ASGARDEO_BASE_URL || "").replace(/\/$/, "");
+        // NEXT_PUBLIC_BASE_URL is the name the webapp uses (see app/lib/auth/guard.ts);
+        // NEXT_PUBLIC_ASGARDEO_BASE_URL is kept as a fallback for existing setups.
+        const baseUrl = (
+            process.env.NEXT_PUBLIC_BASE_URL
+            || process.env.NEXT_PUBLIC_ASGARDEO_BASE_URL
+            || ""
+        ).replace(/\/$/, "");
+
+        if (!baseUrl) {
+            throw new Error(
+                "NEXT_PUBLIC_BASE_URL is not set, so access tokens cannot be verified. "
+                + "Set it in mcp/.env or webapp/.env.local."
+            );
+        }
+
         jwks = createRemoteJWKSet(new URL(`${baseUrl}/oauth2/jwks`));
     }
 
@@ -142,7 +156,12 @@ async function verifyClaims(authorization?: string): Promise<TokenClaims> {
 
     try {
         ({ payload } = await jwtVerify(token, getJwks()));
-    } catch {
+    } catch (error) {
+        // Log the underlying reason: signature, issuer, expiry and JWKS-fetch
+        // failures all surface to the client as the same generic 401.
+        logger.warn(
+            `Token verification failed: ${error instanceof Error ? error.message : String(error)}`
+        );
         throw new AuthError("Invalid or expired token.", 401);
     }
 
@@ -172,6 +191,10 @@ function requireScope(claims: TokenClaims, requiredScopes: string[], policy: Sco
         : requiredScopes.some((s) => claims.scopes.includes(s));
 
     if (!check) {
+        logger.warn(
+            `Scope check failed: required ${policy} of [${requiredScopes.join(", ")}], `
+            + `token has [${claims.scopes.join(", ")}]`
+        );
         throw new AuthError("Insufficient permissions.", 403);
     }
 }
