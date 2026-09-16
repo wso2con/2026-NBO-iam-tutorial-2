@@ -192,38 +192,39 @@ function createModel() {
         openai: "gpt-4o-mini",
         anthropic: "claude-sonnet-4-6",
         deepseek: "deepseek-chat",
-        gemini: "gemini-2.0-flash",
+        gemini: "gemini-3.1-flash-lite",
     };
+    const resolvedModel = modelName || defaultModelNames[provider] || defaultModelNames.gemini;
 
     logger.info({
         provider,
-        model: modelName || defaultModelNames[provider] || "gemini-2.0-flash",
+        model: resolvedModel,
     }, "LLM provider initialized");
 
     switch (provider) {
         case "openai":
             return new ChatOpenAI({
                 apiKey: getEnv("OPENAI_API_KEY"),
-                model: modelName || "gpt-4o-mini",
+                model: resolvedModel,
             });
         case "anthropic":
             return new ChatAnthropic({
                 apiKey: getEnv("ANTHROPIC_API_KEY"),
-                model: modelName || "claude-sonnet-4-6",
+                model: resolvedModel,
                 temperature: null,
                 topP: 1,
             });
         case "deepseek":
             return new ChatOpenAI({
                 apiKey: getEnv("DEEPSEEK_API_KEY"),
-                model: modelName || "deepseek-chat",
+                model: resolvedModel,
                 configuration: { baseURL: "https://api.deepseek.com/v1" },
             });
         case "gemini":
         default:
             return new ChatGoogleGenerativeAI({
                 apiKey: getEnv("GOOGLE_API_KEY"),
-                model: modelName || "gemini-2.0-flash",
+                model: resolvedModel,
             });
     }
 }
@@ -644,10 +645,20 @@ async function exchangeOrganizationToken({
         access_token?: string;
         error?: string;
         error_description?: string;
+        scope?: string;
     };
 
     if (!response.ok || !body.access_token) {
         throw new Error(body.error_description ?? body.error ?? "Failed to exchange token for the organization.");
+    }
+
+    // Asgardeo silently drops scopes the application is not authorized for, so the
+    // granted set can be narrower than what was requested (or empty).
+    if (body.scope !== scopes) {
+        logger.warn({
+            requestedScopes: scopes,
+            grantedScopes: body.scope || "(none)",
+        }, "Asgardeo granted different scopes than requested");
     }
 
     return body.access_token;
@@ -1070,12 +1081,21 @@ function wrapMcpToolsForPermissionTracking<T extends ToolWithSchema>(tools: T[])
 
                 if (isInsufficientPermissionsResponse(result)) {
                     markInsufficientPermissions(tool.name);
+                    logger.warn({ tool: tool.name }, "MCP tool reported insufficient permissions");
                 }
 
                 return result;
             } catch (error) {
                 if (isInsufficientPermissionsResponse(error)) {
                     markInsufficientPermissions(tool.name);
+                    logger.warn({ tool: tool.name }, "MCP tool reported insufficient permissions");
+                } else {
+                    // Without this, tool failures (e.g. a 401 from the MCP server) are
+                    // handed to the LLM as a tool result and never reach the logs.
+                    logger.error({
+                        tool: tool.name,
+                        err: error instanceof Error ? error.message : String(error),
+                    }, "MCP tool invocation failed");
                 }
 
                 throw error;
