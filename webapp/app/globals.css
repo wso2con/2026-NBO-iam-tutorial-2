@@ -818,6 +818,8 @@ strong {
   --app-warning-bg: #fff8eb;
   --app-warning: #a15c07;
   --app-error-bg: #fff5f5;
+  --app-agent-bg: #f1ecff;
+  --app-agent: #5b3bc4;
   /* Aliases used by component inline styles */
   --color-primary: var(--app-primary);
   --color-primary-surface: var(--app-primary-soft);
@@ -4372,6 +4374,27 @@ select.booking-search-input {
   flex-wrap: wrap;
   font-size: 0.82rem;
   gap: 4px;
+}
+
+/* Same pill treatment as .success-pill, in a distinct accent so bookings made
+   by an AI agent are scannable at a glance. */
+.booking-agent-badge {
+  align-items: center;
+  background: var(--app-agent-bg);
+  border-radius: 999px;
+  color: var(--app-agent);
+  display: inline-flex;
+  font-size: 0.78rem;
+  font-style: normal;
+  font-weight: 750;
+  gap: 5px;
+  padding: 2px 9px;
+}
+
+/* Per-agent accent, set via AGENT_DISPLAY_ACCENTS. */
+.booking-agent-badge--green {
+  background: var(--app-success-bg);
+  color: var(--app-success);
 }
 
 .booking-row-right {

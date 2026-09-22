@@ -1,5 +1,6 @@
 import { randomUUID } from "crypto";
 import { NextRequest, NextResponse } from "next/server";
+import { resolveAgentAccent, resolveAgentName } from "../../lib/auth/agents";
 import { requireScope } from "../../lib/auth/guard";
 import { getRolesFromPermissions, Scope, UserRole } from "../../lib/auth/utils";
 import { logRequestActor } from "../../lib/auth/log";
@@ -25,9 +26,18 @@ export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const all = searchParams.get("all") === "true";
 
-  const bookings = isAdmin && all
+  const rows = isAdmin && all
     ? listOrgBookings(orgId)
     : listMyOrgBookings(orgId, sub);
+
+  // The agent's name and accent are resolved here rather than taken from the row, so
+  // renaming or recolouring an agent in the environment applies to past bookings too.
+  // booked_by_agent_name stays as the write-time snapshot the row was created with.
+  const bookings = rows.map((row) => ({
+    ...row,
+    booked_by_agent_name: resolveAgentName(row.booked_by_agent_id) ?? row.booked_by_agent_name,
+    booked_by_agent_accent: resolveAgentAccent(row.booked_by_agent_id),
+  }));
 
   return NextResponse.json({ bookings });
 }
@@ -37,7 +47,7 @@ export async function POST(request: NextRequest) {
   const auth = await requireScope(request, [Scope.BOOKING_CREATE]);
   if (auth instanceof NextResponse) return auth;
 
-  const { orgId, sub, roles } = auth.claims;
+  const { orgId, sub, roles, actSub } = auth.claims;
   const isAdmin = getRolesFromPermissions(roles).includes(UserRole.ADMIN);
 
   let body: Record<string, unknown>;
@@ -80,6 +90,10 @@ export async function POST(request: NextRequest) {
     bookedForName,
     bookedBySub: sub,
     bookedByName,
+    // Normally null here — the web UI calls this with a plain user token — but an
+    // agent calling the REST API directly gets attributed the same way as the MCP path.
+    bookedByAgentId: actSub ?? null,
+    bookedByAgentName: resolveAgentName(actSub ?? null),
     flightId,
     travelers,
     bookingPrice: flight.price * travelers,

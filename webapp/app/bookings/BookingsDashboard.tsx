@@ -34,6 +34,9 @@ interface Booking {
   booking_reference: string;
   booked_for_name: string | null;
   booked_by_name: string;
+  booked_by_agent_id: string | null;
+  booked_by_agent_name: string | null;
+  booked_by_agent_accent: "violet" | "green" | null;
   flight_id: string;
   from_city: string;
   to_city: string;
@@ -241,7 +244,23 @@ function BookingRow({
           <span>{booking.cabin}</span>
           <span>·</span>
           <span>{booking.dates}</span>
-          {isAdmin && (
+          {booking.booked_by_agent_id && (
+            <>
+              <span>·</span>
+              <span>Booked by:</span>
+              <span
+                className={`booking-agent-badge${
+                  booking.booked_by_agent_accent === "green" ? " booking-agent-badge--green" : ""
+                }`}
+                title={booking.booked_by_agent_id}
+              >
+                <span aria-hidden="true">🤖</span>
+                {booking.booked_by_agent_name ?? `${booking.booked_by_agent_id.slice(0, 8)}…`}
+              </span>
+            </>
+          )}
+          {/* The agent badge above already carries the "Booked by:" attribution. */}
+          {isAdmin && !booking.booked_by_agent_id && (
             <>
               <span>·</span>
               <span>Booked by: {booking.booked_by_name}</span>

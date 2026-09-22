@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS org_bookings (
   travelers           INTEGER NOT NULL DEFAULT 1,
   booking_price       REAL,
   status              TEXT    NOT NULL DEFAULT 'confirmed',
+  -- NULL when a human booked through the web UI; set from the OBO token's
+  -- act.sub claim when an AI agent booked on the user's behalf.
+  booked_by_agent_id    TEXT,
+  booked_by_agent_name  TEXT,
   created_at          TEXT    NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (flight_id) REFERENCES flights(id)
 );

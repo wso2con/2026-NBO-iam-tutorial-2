@@ -8,6 +8,8 @@ export interface OrgBooking {
   booked_for_name: string | null;
   booked_by_sub: string;
   booked_by_name: string;
+  booked_by_agent_id: string | null;
+  booked_by_agent_name: string | null;
   flight_id: string;
   travelers: number;
   booking_price: number | null;
@@ -66,6 +68,8 @@ export function createOrgBooking(data: {
   bookedForName: string | null;
   bookedBySub: string;
   bookedByName: string;
+  bookedByAgentId: string | null;
+  bookedByAgentName: string | null;
   flightId: string;
   travelers: number;
   bookingPrice: number | null;
@@ -73,9 +77,9 @@ export function createOrgBooking(data: {
   const db = getDb();
   db.prepare(`
     INSERT INTO org_bookings
-      (id, org_id, booking_reference, booked_for_user_id, booked_for_name, booked_by_sub, booked_by_name, flight_id, travelers, booking_price, status)
+      (id, org_id, booking_reference, booked_for_user_id, booked_for_name, booked_by_sub, booked_by_name, booked_by_agent_id, booked_by_agent_name, flight_id, travelers, booking_price, status)
     VALUES
-      (@id, @org_id, @booking_reference, @booked_for_user_id, @booked_for_name, @booked_by_sub, @booked_by_name, @flight_id, @travelers, @booking_price, 'confirmed')
+      (@id, @org_id, @booking_reference, @booked_for_user_id, @booked_for_name, @booked_by_sub, @booked_by_name, @booked_by_agent_id, @booked_by_agent_name, @flight_id, @travelers, @booking_price, 'confirmed')
   `).run({
     id: data.id,
     org_id: data.orgId,
@@ -84,6 +88,8 @@ export function createOrgBooking(data: {
     booked_for_name: data.bookedForName,
     booked_by_sub: data.bookedBySub,
     booked_by_name: data.bookedByName,
+    booked_by_agent_id: data.bookedByAgentId,
+    booked_by_agent_name: data.bookedByAgentName,
     flight_id: data.flightId,
     travelers: data.travelers,
     booking_price: data.bookingPrice,
