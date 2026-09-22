@@ -76,7 +76,7 @@ Book option 1.
 ```
 
 ```text
-Book flight-nyc-lax-01.
+Book flight-nbo-dxb-02.
 ```
 
 ## WebSocket Protocol
