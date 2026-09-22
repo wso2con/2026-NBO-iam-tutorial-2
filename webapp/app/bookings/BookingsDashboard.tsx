@@ -566,7 +566,7 @@ export default function BookingsDashboard({ roles }: { roles: UserRole[] }) {
               From
               <input
                 className="booking-search-input"
-                placeholder="e.g. New York"
+                placeholder="e.g. Nairobi"
                 value={fromCity}
                 onChange={(e) => setFromCity(e.target.value)}
               />
@@ -575,7 +575,7 @@ export default function BookingsDashboard({ roles }: { roles: UserRole[] }) {
               To
               <input
                 className="booking-search-input"
-                placeholder="e.g. Los Angeles"
+                placeholder="e.g. Mombasa"
                 value={toCity}
                 onChange={(e) => setToCity(e.target.value)}
               />

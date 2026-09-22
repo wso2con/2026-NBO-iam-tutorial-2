@@ -378,8 +378,8 @@ function createEnterpriseMcpServer(authorization?: string, reqId?: number) {
         "search_enterprise_flights",
         "Search available flight options from the Wayfinder booking database.",
         {
-            from: z.string().optional().describe("Origin city, for example New York."),
-            to: z.string().optional().describe("Destination city, for example Los Angeles."),
+            from: z.string().optional().describe("Origin city, for example Nairobi."),
+            to: z.string().optional().describe("Destination city, for example Mombasa."),
             cabin: z.enum(["Economy", "Premium Economy", "Business", "First Class"]).optional(),
         },
         ({ from, to, cabin }) =>
