@@ -24,6 +24,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { ansiColor, createLogger } from "./logger.js";
+import { resolveAgentName } from "../webapp/app/lib/auth/agents.js";
 import {
     getRolesFromPermissions,
     Scope,
@@ -106,6 +107,18 @@ interface TokenClaims {
     scopes: string[];
     sub: string;
     roles: string[];
+    /** act.sub — the AI agent acting on the user's behalf, or null for a direct call. */
+    actSub: string | null;
+}
+
+function readActSub(act: unknown): string | null {
+    if (typeof act !== "object" || act === null) {
+        return null;
+    }
+
+    const sub = (act as { sub?: unknown }).sub;
+
+    return typeof sub === "string" && sub.length > 0 ? sub : null;
 }
 
 class AuthError extends Error {
@@ -180,7 +193,7 @@ async function verifyClaims(authorization?: string): Promise<TokenClaims> {
         ? [rawRoles]
         : [];
 
-    return { orgId, scopes, sub, roles };
+    return { orgId, scopes, sub, roles, actSub: readActSub(payload.act) };
 }
 
 type ScopePolicy = "any" | "all";
@@ -451,7 +464,13 @@ function createEnterpriseMcpServer(authorization?: string, reqId?: number) {
                         bookedForUserId: resolvedBookedForUserId,
                         bookedForName: resolvedBookedForName,
                         bookedBySub: claims.sub,
-                        bookedByName: bookedByName ?? "AI-assisted user",
+                        // The human the booking is for — the agent's own identity
+                        // goes in the booked_by_agent_* columns below.
+                        bookedByName: bookedByName ?? "User",
+                        // claims comes from verifyClaims, so act.sub here is signature-verified;
+                        // actSubClaim above is an unverified decode kept only for log lines.
+                        bookedByAgentId: claims.actSub,
+                        bookedByAgentName: resolveAgentName(claims.actSub),
                         flightId,
                         travelers: travelerCount,
                         bookingPrice: flight.price * travelerCount,

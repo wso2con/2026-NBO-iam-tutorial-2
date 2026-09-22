@@ -6,6 +6,14 @@ export interface TokenClaims {
   scopes: string[];
   sub: string;
   roles: string[];
+  /** act.sub — the AI agent acting on the user's behalf, or null for a direct call. */
+  actSub: string | null;
+}
+
+function readActSub(act: unknown): string | null {
+  if (typeof act !== "object" || act === null) return null;
+  const sub = (act as { sub?: unknown }).sub;
+  return typeof sub === "string" && sub.length > 0 ? sub : null;
 }
 
 let _jwks: ReturnType<typeof createRemoteJWKSet> | null = null;
@@ -52,7 +60,9 @@ export async function requireAuth(
       ? [rawRoles]
       : [];
 
-    return { claims: { orgId, scopes, sub, roles } };
+    const actSub = readActSub(payload.act);
+
+    return { claims: { orgId, scopes, sub, roles, actSub } };
   } catch {
     return NextResponse.json({ error: "Invalid or expired token." }, { status: 401 });
   }

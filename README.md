@@ -39,7 +39,7 @@ Root Organization (Wayfinder Enterprise)
 ## Project Structure
 
 ```text
-2026-AUS-iam-tutorial-2/
+2026-NBO-iam-tutorial-2/
 ├── README.md                  # Main tutorial guide (this file)
 ├── webapp/                    # Next.js B2B app (port 3000)
 │   ├── app/                   # Next.js App Router pages and API routes
