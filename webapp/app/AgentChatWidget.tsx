@@ -23,6 +23,21 @@ interface AgentPayload {
 const AGENT_CHAT_URL = process.env.NEXT_PUBLIC_AGENT_CHAT_URL || "ws://localhost:8791/chat";
 const AGENT_HTTP_BASE_URL = process.env.NEXT_PUBLIC_AGENT_HTTP_BASE_URL || toHttpBaseUrl(AGENT_CHAT_URL);
 
+// Orgs the web chat agent is hidden from (name or org ID).
+const CHAT_AGENT_HIDDEN_ORGS = new Set(
+  (process.env.NEXT_PUBLIC_AGENT_CHAT_HIDDEN_ORGS ?? "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean)
+);
+
+function isChatAgentSharedWith(user: { orgId?: string; orgName?: string } | null) {
+  return !(
+    CHAT_AGENT_HIDDEN_ORGS.has((user?.orgName ?? "").toLowerCase()) ||
+    CHAT_AGENT_HIDDEN_ORGS.has((user?.orgId ?? "").toLowerCase())
+  );
+}
+
 function toHttpBaseUrl(url: string) {
   try {
     const parsed = new URL(url);
@@ -416,7 +431,7 @@ export default function AgentChatWidget() {
     }));
   }
 
-  if (!isSignedIn || !accessToken) {
+  if (!isSignedIn || !accessToken || !isChatAgentSharedWith(user)) {
     return null;
   }
 
