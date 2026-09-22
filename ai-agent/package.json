@@ -25,7 +25,7 @@
     "tsx": "^4.19.4"
   },
   "overrides": {
-    "@modelcontextprotocol/sdk": "1.12.1"
+    "@modelcontextprotocol/sdk": "^1.30.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.19"

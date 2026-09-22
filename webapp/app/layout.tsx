@@ -39,7 +39,7 @@ export default async function RootLayout({
 
   return (
     <html lang="en" className={inter.className}>
-      <body>
+      <body suppressHydrationWarning>
         <AuthProvider initialIsExchanging={hasCode || hasOrgId || hasSubjectToken}>
           <BrandingProvider>
             {children}
