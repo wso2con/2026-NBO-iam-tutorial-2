@@ -16,7 +16,8 @@ limitations under the License.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 import type { Duplex } from "node:stream";
 
@@ -85,6 +86,24 @@ function formatLogContext(context: LogContext) {
     return entries.length > 0 ? ` ${entries.join(" ")}` : "";
 }
 
+// Mirror logs to a per-port file, since OBO callbacks land long after the terminal scrolls.
+const logFilePath = getEnv("AGENT_LOG_FILE")
+    || resolve(__dirname, "logs", `agent-${getEnv("AGENT_PORT") || "8791"}.log`);
+
+try {
+    mkdirSync(dirname(logFilePath), { recursive: true });
+} catch {
+    // A missing log file must never stop startup.
+}
+
+function appendLogFile(line: string) {
+    try {
+        appendFileSync(logFilePath, `${line}\n`);
+    } catch {
+        // Logging must never break a request.
+    }
+}
+
 function createLogger(context: LogContext = {}) {
     const configuredLevel = normalizeLogLevel(process.env.LOG_LEVEL);
 
@@ -98,6 +117,8 @@ function createLogger(context: LogContext = {}) {
         const timestamp = new Date().toISOString();
         const contextText = formatLogContext({ ...context, ...childContext });
         const line = `${timestamp} ${level.toUpperCase()} ${message}${contextText}`;
+
+        appendLogFile(line);
 
         if (level === "warn") {
             console.warn(line);
@@ -144,11 +165,27 @@ function getEnv(name: string) {
     return process.env[name]?.trim() || "";
 }
 
+// An organization-qualified base URL (.../t/<tenant>/o/<org-id>) signs the agent in natively
+// inside that sub-organization instead of switching into it from the root tenant.
+const asgardeoBaseUrl = getEnv("ASGARDEO_BASE_URL").replace(/\/$/, "");
+
+// True when ASGARDEO_BASE_URL already points inside a sub-organization.
+const isOrganizationQualifiedBaseUrl = /\/o\/[^/]+$/.test(asgardeoBaseUrl);
+
 const asgardeoConfig = {
     afterSignInUrl: getEnv("REDIRECT_URI"),
     clientId: getEnv("CLIENT_ID"),
     clientSecret: getEnv("CLIENT_SECRET"),
-    baseUrl: getEnv("ASGARDEO_BASE_URL").replace(/\/$/, ""),
+    baseUrl: asgardeoBaseUrl,
+    // A sub-org native agent never switches organizations, so it must request API scopes here.
+    scopes: getEnv("AGENT_SIGN_IN_SCOPES"),
+    // A sub-org's tokens are issued under the ROOT issuer, which the SDK cannot guess from
+    // the base URL alone, so let it read the organization's discovery document instead.
+    ...(isOrganizationQualifiedBaseUrl
+        ? { wellKnownEndpoint: `${asgardeoBaseUrl}/oauth2/token/.well-known/openid-configuration` }
+        : {}),
+    // Escape hatch for apps configured to issue under the organization-qualified issuer.
+    ...(getEnv("ASGARDEO_ISSUER") ? { endpoints: { issuer: getEnv("ASGARDEO_ISSUER") } } : {}),
 };
 
 const agentConfig = {
@@ -164,6 +201,43 @@ const oboRedirectUri = getEnv("OBO_REDIRECT_URI") || new URL("/obo/callback", as
 const oboResource = getEnv("OBO_RESOURCE");
 const oboRequiredMessage = "I need your authorization to perform this action. Please click the Authorize button to grant me access.";
 const insufficientPermissionsPattern = /insufficient permissions/i;
+const whatsappConfig = {
+    token: getEnv("WHATSAPP_TOKEN"),
+    phoneNumberId: getEnv("WHATSAPP_PHONE_NUMBER_ID"),
+    verifyToken: getEnv("WHATSAPP_VERIFY_TOKEN"),
+    appSecret: getEnv("WHATSAPP_APP_SECRET"),
+    orgMap: getEnv("WHATSAPP_ORG_MAP"),
+    dryRun: getEnv("WHATSAPP_DRY_RUN").toLowerCase() === "true",
+};
+
+// WhatsApp is opt-in: without a sender phone number ID its routes are never registered.
+const isWhatsAppEnabled = Boolean(whatsappConfig.phoneNumberId);
+
+const whatsappOrgMap: Record<string, string> = (() => {
+    if (!isWhatsAppEnabled || !whatsappConfig.orgMap) {
+        return {};
+    }
+
+    try {
+        const parsed: unknown = JSON.parse(whatsappConfig.orgMap);
+
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            logger.warn("WHATSAPP_ORG_MAP must be a JSON object of phone number to organization ID");
+
+            return {};
+        }
+
+        return Object.fromEntries(
+            Object.entries(parsed as Record<string, unknown>)
+                .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+        );
+    } catch (error: unknown) {
+        logger.error({ err: error }, "Failed to parse WHATSAPP_ORG_MAP");
+
+        return {};
+    }
+})();
+
 const allowedCorsOrigin = (() => {
     try {
         return new URL(appBaseUrl).origin;
@@ -211,7 +285,7 @@ function createModel() {
             return new ChatAnthropic({
                 apiKey: getEnv("ANTHROPIC_API_KEY"),
                 model: resolvedModel,
-                temperature: null,
+                temperature: undefined,
                 topP: 1,
             });
         case "deepseek":
@@ -326,7 +400,18 @@ type AgentRuntime = {
 };
 
 type RootAgentRuntime = {
-    agentActorToken: string;
+    /** Returns a valid agent actor token; pass a rejected token to force a re-sign-in. */
+    getAgentActorToken: (staleToken?: string) => Promise<string>;
+};
+
+type AutonomousRuntimeEntry = {
+    expiresAt: number;
+    runtime: AgentRuntime;
+};
+
+type ReplyChannel = {
+    send: (payload: Record<string, unknown>) => boolean;
+    isAlive: () => boolean;
 };
 
 type PendingDelegation = {
@@ -335,7 +420,7 @@ type PendingDelegation = {
     orgId?: string;
     request: ParsedChatRequest;
     scopes: string;
-    socket: Duplex;
+    reply: ReplyChannel;
 };
 
 type WebSocketFrame = {
@@ -353,7 +438,7 @@ type JsonSchemaObject = {
 type ToolWithSchema = {
     name?: string;
     schema?: unknown;
-    invoke?: (...args: unknown[]) => Promise<unknown> | unknown;
+    invoke?: (...args: any[]) => Promise<unknown> | unknown;
 };
 
 type PermissionTrackingContext = {
@@ -617,6 +702,25 @@ function getTokenOrganizationId(token: string): string {
     return typeof payload?.org_id === "string" ? payload.org_id : "";
 }
 
+// Expire tokens a minute early so one cannot lapse mid-request.
+const TOKEN_EXPIRY_SKEW_MS = 60_000;
+const DEFAULT_TOKEN_LIFETIME_MS = 3_600_000;
+
+function getTokenExpiryMs(token: string): number {
+    const exp = decodeJwtPayload(token)?.exp;
+
+    return typeof exp === "number" ? exp * 1000 : Date.now() + DEFAULT_TOKEN_LIFETIME_MS;
+}
+
+function isTokenValid(expiresAt: number): boolean {
+    return expiresAt - TOKEN_EXPIRY_SKEW_MS > Date.now();
+}
+
+// Asgardeo reports both an expired and a superseded actor token as "Invalid token received."
+function isRejectedTokenError(error: unknown): boolean {
+    return error instanceof Error && /invalid token|invalid_grant|token.*expired/i.test(error.message);
+}
+
 async function exchangeOrganizationToken({
     scopes,
     switchingOrganizationId,
@@ -744,15 +848,19 @@ function buildOboAuthorizeUrl(state: string, request: ParsedChatRequest, scopes 
         params.set("resource", oboResource);
     }
 
-    if (request.orgName) {
-        params.set("org", request.orgName);
-    }
+    // org / orgId / fidp route a user from the ROOT endpoint into their sub-organization;
+    // an organization-qualified base URL is already there and would fail on them.
+    if (!isOrganizationQualifiedBaseUrl) {
+        if (request.orgName) {
+            params.set("org", request.orgName);
+        }
 
-    if (request.orgId) {
-        params.set("orgId", request.orgId);
-    }
+        if (request.orgId) {
+            params.set("orgId", request.orgId);
+        }
 
-    params.set("fidp", "OrganizationSSO");
+        params.set("fidp", "OrganizationSSO");
+    }
 
     return `${asgardeoConfig.baseUrl}/oauth2/authorize?${params.toString()}`;
 }
@@ -764,7 +872,8 @@ async function exchangeOboAuthorizationCode(code: string, agentActorToken: strin
         body: new URLSearchParams({
             actor_token: agentActorToken,
             client_id: asgardeoConfig.clientId,
-            client_secret: asgardeoConfig.clientSecret,
+            // A public client has no secret, and Asgardeo rejects an empty one outright.
+            ...(asgardeoConfig.clientSecret ? { client_secret: asgardeoConfig.clientSecret } : {}),
             code,
             grant_type: "authorization_code",
             redirect_uri: oboRedirectUri,
@@ -925,6 +1034,11 @@ function closeWebSocket(socket: Duplex) {
     }
 }
 
+const makeSocketReply = (socket: Duplex): ReplyChannel => ({
+    send: (payload) => sendJson(socket, payload),
+    isAlive: () => isSocketWritable(socket),
+});
+
 function redactSecret(value: string) {
     if (!value) {
         return "";
@@ -978,10 +1092,10 @@ function validateAgentConfiguration() {
     };
     const apiKeyEnvVar = providerApiKeyEnvVar[modelProvider] ?? "GOOGLE_API_KEY";
 
+    // CLIENT_SECRET is deliberately absent: a sub-organization app is typically public.
     const requiredValues: Record<string, string | undefined> = {
         ASGARDEO_BASE_URL: asgardeoConfig.baseUrl,
         CLIENT_ID: asgardeoConfig.clientId,
-        CLIENT_SECRET: asgardeoConfig.clientSecret,
         REDIRECT_URI: asgardeoConfig.afterSignInUrl,
         AGENT_ID: agentConfig.agentID,
         AGENT_SECRET: agentConfig.agentSecret,
@@ -993,6 +1107,12 @@ function validateAgentConfiguration() {
 
     if (missingValues.length > 0) {
         throw new Error(`Missing required AI agent environment values: ${missingValues.join(", ")}`);
+    }
+
+    if (!asgardeoConfig.clientSecret) {
+        logger.warn({
+            clientId: redactSecret(asgardeoConfig.clientId),
+        }, "CLIENT_SECRET is not set - treating the application as a public client");
     }
 
     if (asgardeoConfig.baseUrl.includes("<") || asgardeoConfig.baseUrl.includes(">")) {
@@ -1038,6 +1158,231 @@ async function readJsonRequestBody(request: IncomingMessage): Promise<unknown> {
     const body = Buffer.concat(chunks).toString("utf8");
 
     return body ? JSON.parse(body) : undefined;
+}
+
+const WHATSAPP_GRAPH_API_VERSION = "v21.0";
+const WHATSAPP_HANDLED_MESSAGE_LIMIT = 500;
+
+// Meta redelivers webhooks, so track handled message IDs, evicting the oldest ones.
+const whatsappHandledMessageIds = new Set<string>();
+
+function rememberWhatsAppMessageId(messageId: string): boolean {
+    if (whatsappHandledMessageIds.has(messageId)) {
+        return false;
+    }
+
+    whatsappHandledMessageIds.add(messageId);
+
+    while (whatsappHandledMessageIds.size > WHATSAPP_HANDLED_MESSAGE_LIMIT) {
+        const oldest = whatsappHandledMessageIds.values().next();
+
+        if (oldest.done) {
+            break;
+        }
+
+        whatsappHandledMessageIds.delete(oldest.value);
+    }
+
+    return true;
+}
+
+// WhatsApp sends no history with a webhook, so the conversation is kept server-side.
+const WHATSAPP_HISTORY_MESSAGE_LIMIT = 20;
+const WHATSAPP_HISTORY_IDLE_MS = 30 * 60_000;
+const WHATSAPP_CONVERSATION_LIMIT = 200;
+
+type WhatsAppConversation = {
+    messages: ChatMessage[];
+    updatedAt: number;
+};
+
+const whatsappConversations = new Map<string, WhatsAppConversation>();
+
+function getWhatsAppConversation(from: string): WhatsAppConversation {
+    const existing = whatsappConversations.get(from);
+
+    // A conversation gone quiet is a new request, and stale results would mislead the model.
+    if (existing && Date.now() - existing.updatedAt <= WHATSAPP_HISTORY_IDLE_MS) {
+        return existing;
+    }
+
+    const conversation: WhatsAppConversation = { messages: [], updatedAt: Date.now() };
+
+    whatsappConversations.set(from, conversation);
+
+    while (whatsappConversations.size > WHATSAPP_CONVERSATION_LIMIT) {
+        const oldest = whatsappConversations.keys().next();
+
+        if (oldest.done || oldest.value === from) {
+            break;
+        }
+
+        whatsappConversations.delete(oldest.value);
+    }
+
+    return conversation;
+}
+
+function rememberWhatsAppMessage(from: string, message: ChatMessage): ChatMessage[] {
+    const conversation = getWhatsAppConversation(from);
+
+    conversation.messages.push(message);
+    conversation.updatedAt = Date.now();
+
+    if (conversation.messages.length > WHATSAPP_HISTORY_MESSAGE_LIMIT) {
+        conversation.messages = conversation.messages.slice(-WHATSAPP_HISTORY_MESSAGE_LIMIT);
+    }
+
+    // Snapshot the history: a pending delegation replays its copy long after this turn.
+    return [...conversation.messages];
+}
+
+async function sendWhatsAppText(to: string, body: string): Promise<void> {
+    if (whatsappConfig.dryRun) {
+        logger.info({ to, body }, "WhatsApp DRY RUN outbound message");
+
+        return;
+    }
+
+    const response = await fetch(
+        `https://graph.facebook.com/${WHATSAPP_GRAPH_API_VERSION}/${whatsappConfig.phoneNumberId}/messages`,
+        {
+            body: JSON.stringify({
+                messaging_product: "whatsapp",
+                to,
+                type: "text",
+                // preview_url renders the authorization link as a tappable card.
+                text: { body, preview_url: true },
+            }),
+            headers: {
+                "Authorization": `Bearer ${whatsappConfig.token}`,
+                "Content-Type": "application/json",
+            },
+            method: "POST",
+        }
+    );
+
+    if (!response.ok) {
+        const errorBody = await response.text().catch(() => "");
+
+        logger.error({
+            status: response.status,
+            statusText: response.statusText,
+            body: errorBody.slice(0, 500),
+            to,
+        }, "Failed to send WhatsApp message");
+
+        return;
+    }
+
+    logger.info({ to, bodyLength: body.length }, "WhatsApp message sent");
+}
+
+// The signature covers the exact bytes Meta sent, which readJsonRequestBody discards.
+async function readRawRequestBody(request: IncomingMessage): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+
+    for await (const chunk of request) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+
+    return Buffer.concat(chunks);
+}
+
+function isValidWhatsAppSignature(rawBody: Buffer, signatureHeader: string | string[] | undefined): boolean {
+    const signature = Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader;
+
+    if (!signature || !signature.startsWith("sha256=")) {
+        return false;
+    }
+
+    const expected = Buffer.from(
+        `sha256=${createHmac("sha256", whatsappConfig.appSecret).update(rawBody).digest("hex")}`,
+        "utf8"
+    );
+    const received = Buffer.from(signature, "utf8");
+
+    if (expected.length !== received.length) {
+        return false;
+    }
+
+    return timingSafeEqual(expected, received);
+}
+
+function handleWhatsAppVerification(url: URL, response: ServerResponse) {
+    const mode = url.searchParams.get("hub.mode");
+    const verifyToken = url.searchParams.get("hub.verify_token");
+    const challenge = url.searchParams.get("hub.challenge");
+
+    if (mode === "subscribe" && whatsappConfig.verifyToken && verifyToken === whatsappConfig.verifyToken) {
+        logger.info("WhatsApp webhook verification succeeded");
+        response.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+        response.end(challenge || "");
+
+        return;
+    }
+
+    logger.warn({ mode }, "WhatsApp webhook verification failed");
+    response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("Forbidden");
+}
+
+type WhatsAppInboundTextMessage = {
+    id: string;
+    from: string;
+    text: string;
+};
+
+type WhatsAppInboundMessage =
+    | { kind: "text"; message: WhatsAppInboundTextMessage }
+    | { kind: "unsupported"; id: string; from: string }
+    | { kind: "ignore" };
+
+// Meta posts status callbacks to the same URL, so payloads without messages[] are ignored.
+function parseWhatsAppInboundMessage(payload: unknown): WhatsAppInboundMessage {
+    const entries = (payload as { entry?: unknown })?.entry;
+
+    if (!Array.isArray(entries)) {
+        return { kind: "ignore" };
+    }
+
+    for (const entry of entries) {
+        const changes = (entry as { changes?: unknown })?.changes;
+
+        if (!Array.isArray(changes)) {
+            continue;
+        }
+
+        for (const change of changes) {
+            const value = (change as { value?: unknown })?.value as { messages?: unknown } | undefined;
+            const messages = value?.messages;
+
+            if (!Array.isArray(messages) || messages.length === 0) {
+                continue;
+            }
+
+            const message = messages[0] as {
+                id?: unknown;
+                from?: unknown;
+                type?: unknown;
+                text?: { body?: unknown };
+            };
+            const id = typeof message.id === "string" ? message.id : "";
+            const from = typeof message.from === "string" ? message.from : "";
+
+            if (!id || !from) {
+                continue;
+            }
+
+            if (message.type !== "text" || typeof message.text?.body !== "string") {
+                return { kind: "unsupported", id, from };
+            }
+
+            return { kind: "text", message: { id, from, text: message.text.body } };
+        }
+    }
+
+    return { kind: "ignore" };
 }
 
 function isInsufficientPermissionsResponse(value: unknown): boolean {
@@ -1090,8 +1435,7 @@ function wrapMcpToolsForPermissionTracking<T extends ToolWithSchema>(tools: T[])
                     markInsufficientPermissions(tool.name);
                     logger.warn({ tool: tool.name }, "MCP tool reported insufficient permissions");
                 } else {
-                    // Without this, tool failures (e.g. a 401 from the MCP server) are
-                    // handed to the LLM as a tool result and never reach the logs.
+                    // Tool failures otherwise reach only the LLM, never the logs.
                     logger.error({
                         tool: tool.name,
                         err: error instanceof Error ? error.message : String(error),
@@ -1134,18 +1478,47 @@ async function createMcpAgent(authorization: string, mode: ChatInvocationMode): 
     return { agent, client, tools };
 }
 
-async function getAutonomousAgentOrganizationToken(rootAgentToken: string, organizationId: string) {
+async function getAutonomousAgentOrganizationToken(rootRuntime: RootAgentRuntime, organizationId: string) {
     logger.info({
         organizationId,
         tokenType: "autonomous-agent",
         scopes: autonomousTravelPolicyScopes,
     }, `[org: ${organizationId}] Obtaining autonomous agent organization-scoped token`);
 
-    const token = await exchangeOrganizationToken({
+    const exchange = (rootAgentToken: string) => exchangeOrganizationToken({
         scopes: autonomousTravelPolicyScopes,
         switchingOrganizationId: organizationId,
         token: rootAgentToken,
     });
+
+    const rootAgentToken = await rootRuntime.getAgentActorToken();
+
+    // organization_switch into the organization the token already carries is rejected.
+    if (getTokenOrganizationId(rootAgentToken) === organizationId) {
+        logger.info({
+            organizationId,
+            tokenType: "autonomous-agent",
+        }, `[org: ${organizationId}] Agent token is already scoped to the organization, skipping exchange`);
+
+        return rootAgentToken;
+    }
+
+    let token: string;
+
+    try {
+        token = await exchange(rootAgentToken);
+    } catch (error: unknown) {
+        if (!isRejectedTokenError(error)) {
+            throw error;
+        }
+
+        logger.warn({
+            organizationId,
+            err: error,
+        }, `[org: ${organizationId}] Agent actor token was rejected - signing in again and retrying once`);
+
+        token = await exchange(await rootRuntime.getAgentActorToken(rootAgentToken));
+    }
 
     logger.info({ organizationId, tokenType: "autonomous-agent" }, `[org: ${organizationId}] Autonomous agent organization-scoped token obtained`);
 
@@ -1183,26 +1556,82 @@ async function getDelegatedUserOrganizationToken(accessToken: string, orgId?: st
 async function createRootAgentRuntime(): Promise<RootAgentRuntime> {
     logger.info("Starting Wayfinder Enterprise AI agent with Asgardeo and LangChain");
     validateAgentConfiguration();
-    logger.info({
-        baseUrl: asgardeoConfig.baseUrl,
-        clientId: redactSecret(asgardeoConfig.clientId),
-        redirectUri: asgardeoConfig.afterSignInUrl,
-        agentId: redactSecret(agentConfig.agentID),
-    }, "Requesting Asgardeo agent token");
 
     const asgardeoJavaScriptClient = new AsgardeoJavaScriptClient(asgardeoConfig);
     includeClientSecretInAgentAuthorizeRequest(asgardeoJavaScriptClient);
-    const agentToken = await asgardeoJavaScriptClient.getAgentToken(agentConfig);
 
-    return {
-        agentActorToken: agentToken.accessToken,
+    // Agent sign-in is single-session, so mint through a single-flight cache to stop
+    // concurrent requests invalidating each other's token.
+    let pendingToken: Promise<{ expiresAt: number; token: string }> | null = null;
+
+    const signIn = () => {
+        logger.info({
+            baseUrl: asgardeoConfig.baseUrl,
+            clientId: redactSecret(asgardeoConfig.clientId),
+            redirectUri: asgardeoConfig.afterSignInUrl,
+            agentId: redactSecret(agentConfig.agentID),
+        }, "Requesting Asgardeo agent token");
+
+        const promise = (async () => {
+            const agentToken = await asgardeoJavaScriptClient.getAgentToken(agentConfig);
+            const expiresAt = getTokenExpiryMs(agentToken.accessToken);
+
+            logger.info({
+                agentId: redactSecret(agentConfig.agentID),
+                expiresAt: new Date(expiresAt).toISOString(),
+            }, "Asgardeo agent token obtained");
+
+            return { expiresAt, token: agentToken.accessToken };
+        })();
+
+        pendingToken = promise;
+        promise.catch(() => {
+            // Never leave a rejected sign-in cached, or the agent stays broken until restart.
+            if (pendingToken === promise) {
+                pendingToken = null;
+            }
+        });
+
+        return promise;
     };
+
+    const getAgentActorToken = async (staleToken?: string): Promise<string> => {
+        const inFlight = pendingToken;
+
+        if (inFlight) {
+            const current = await inFlight;
+
+            if (isTokenValid(current.expiresAt) && current.token !== staleToken) {
+                return current.token;
+            }
+
+            // Another caller may have re-signed-in while awaiting - or failed and cleared it.
+            const refreshed = pendingToken;
+
+            if (refreshed && refreshed !== inFlight) {
+                return (await refreshed).token;
+            }
+        }
+
+        return (await signIn()).token;
+    };
+
+    // Sign in eagerly so bad credentials fail startup, not the first chat message.
+    await getAgentActorToken();
+
+    return { getAgentActorToken };
 }
 
-async function createAutonomousAgentRuntime(rootRuntime: RootAgentRuntime, organizationId: string) {
-    const organizationAccessToken = await getAutonomousAgentOrganizationToken(rootRuntime.agentActorToken, organizationId);
+async function createAutonomousAgentRuntime(
+    rootRuntime: RootAgentRuntime,
+    organizationId: string,
+): Promise<AutonomousRuntimeEntry> {
+    const organizationAccessToken = await getAutonomousAgentOrganizationToken(rootRuntime, organizationId);
+    const runtime = await createMcpAgent(`Bearer ${organizationAccessToken}`, "agent");
 
-    return createMcpAgent(`Bearer ${organizationAccessToken}`, "agent");
+    // MultiServerMCPClient fixes its Authorization header at construction, so the runtime
+    // lives only as long as the token it was built with.
+    return { expiresAt: getTokenExpiryMs(organizationAccessToken), runtime };
 }
 
 
@@ -1237,7 +1666,7 @@ async function invokeWithDelegatedUserAccess(request: ParsedChatRequest, delegat
 }
 
 function registerPendingDelegation(
-    socket: Duplex,
+    reply: ReplyChannel,
     request: ParsedChatRequest,
     flightId?: string,
     scopes = delegatedBookingScopes
@@ -1250,7 +1679,7 @@ function registerPendingDelegation(
         orgId: request.orgId,
         request,
         scopes,
-        socket,
+        reply,
     });
 
     return {
@@ -1365,7 +1794,7 @@ async function handleOboCallback(url: URL, response: ServerResponse, agentActorT
 
     try {
         logger.info({
-            hasPendingSocket: isSocketWritable(pending.socket),
+            hasPendingSocket: pending.reply.isAlive(),
             messageCount: pending.request.messages.length,
         }, "Completing delegated authorization callback");
 
@@ -1375,35 +1804,314 @@ async function handleOboCallback(url: URL, response: ServerResponse, agentActorT
         const responseMessage = await invokeWithDelegatedUserAccess(pending.request, delegatedAccessToken);
         logger.info({
             responseLength: responseMessage.length,
-            socketWritable: isSocketWritable(pending.socket),
+            socketWritable: pending.reply.isAlive(),
         }, "Sending delegated agent response over WebSocket");
 
-        const sent = sendJson(pending.socket, {
+        const sent = pending.reply.send({
             type: "response",
             message: responseMessage,
         });
         logger.info({ sent }, "Delegated agent WebSocket response send completed");
     } catch (callbackError) {
         logger.error({ err: callbackError }, "Failed to complete delegated authorization callback");
-        sendJson(pending.socket, {
+        pending.reply.send({
             type: "error",
             message: "I couldn't complete the authorization. Please try approving the action again.",
         });
     }
 }
 
+async function handleChatTurn(params: {
+    chatRequest: ParsedChatRequest;
+    orgId: string;
+    reply: ReplyChannel;
+    isCancelled: () => boolean;
+    markCancelled: () => void;
+    getAutonomousRuntime: (orgId: string) => Promise<AgentRuntime>;
+    logger: ReturnType<typeof createLogger>;
+}): Promise<void> {
+    const { chatRequest, orgId, reply, isCancelled, markCancelled, getAutonomousRuntime, logger: messageLogger } = params;
+
+    const llmMessages = addContextToFirstUserMessage(
+        chatRequest.messages,
+        `Authenticated organization ID for this chat: ${orgId}`
+    );
+
+    if (!reply.send({ type: "processing" })) {
+        markCancelled();
+        return;
+    }
+
+    messageLogger.info("Processing chat message");
+
+    let responseMessage: string;
+    const permissionTracking: PermissionTrackingContext = {
+        hasInsufficientPermissions: false,
+    };
+
+    try {
+        const autonomousRuntime = await getAutonomousRuntime(orgId);
+        const result = await permissionTrackingContext.run(
+            permissionTracking,
+            () => autonomousRuntime.agent.invoke({ messages: llmMessages })
+        );
+
+        responseMessage = getResponseContent(
+            result.messages.at(-1)?.content
+        );
+    } catch (error) {
+        if (isInsufficientPermissionsResponse(error)) {
+            markInsufficientPermissions();
+            permissionTracking.hasInsufficientPermissions = true;
+        }
+
+        if (permissionTracking.hasInsufficientPermissions) {
+            const { authorizationRequestId } = registerPendingDelegation(
+                reply,
+                chatRequest,
+                undefined,
+                delegatedBookingScopes
+            );
+
+            reply.send({
+                type: "obo_required",
+                message: oboRequiredMessage,
+                authorizationRequestId,
+            });
+            messageLogger.info({
+                authorizationRequestId,
+                toolName: permissionTracking.toolName,
+            }, "Delegated authorization required after MCP permission error");
+
+            return;
+        }
+
+        throw error;
+    }
+
+    if (isCancelled()) {
+        return;
+    }
+
+    if (permissionTracking.hasInsufficientPermissions || isInsufficientPermissionsResponse(responseMessage)) {
+        const { authorizationRequestId } = registerPendingDelegation(
+            reply,
+            chatRequest,
+            undefined,
+            delegatedBookingScopes
+        );
+
+        reply.send({
+            type: "obo_required",
+            message: oboRequiredMessage,
+            authorizationRequestId,
+        });
+        messageLogger.info({
+            authorizationRequestId,
+            toolName: permissionTracking.toolName,
+        }, "Delegated authorization required after MCP permission response");
+
+        return;
+    }
+
+    reply.send({
+        type: "response",
+        message: responseMessage,
+    });
+    messageLogger.info({ responseLength: responseMessage.length }, "Chat message processed");
+}
+
+async function handleWhatsAppTurn(
+    message: WhatsAppInboundTextMessage,
+    getAutonomousRuntime: (orgId: string) => Promise<AgentRuntime>,
+    messageLogger: ReturnType<typeof createLogger>
+): Promise<void> {
+    const from = message.from;
+    // Map lookup only: an org ID from the payload would let any sender read another company's data.
+    const orgId = whatsappOrgMap[from];
+
+    if (!orgId) {
+        messageLogger.warn("WhatsApp message from an unmapped number");
+        await sendWhatsAppText(from, "This number isn't registered");
+
+        return;
+    }
+
+    const chatRequest: ParsedChatRequest = {
+        messages: rememberWhatsAppMessage(from, { role: "user", content: message.text }),
+        orgId,
+    };
+
+    const reply: ReplyChannel = {
+        send: (payload) => {
+            if (payload.type === "processing") {
+                return true;
+            }
+
+            const text = String(payload.message ?? "");
+
+            if (payload.type === "obo_required") {
+                const authorizeUrl = buildOboAuthorizeUrl(
+                    String(payload.authorizationRequestId),
+                    chatRequest,
+                    delegatedBookingScopes
+                );
+
+                // The link is a one-off, so keep it out of the history the model sees.
+                rememberWhatsAppMessage(from, { role: "assistant", content: text });
+                void sendWhatsAppText(from, `${text}\n\n${authorizeUrl}`);
+
+                return true;
+            }
+
+            // Errors are not part of the conversation the model should reason about.
+            if (payload.type !== "error") {
+                rememberWhatsAppMessage(from, { role: "assistant", content: text });
+            }
+
+            void sendWhatsAppText(from, text);
+
+            return true;
+        },
+        // WhatsApp has no persistent connection to keep alive or cancel.
+        isAlive: () => true,
+    };
+
+    await handleChatTurn({
+        chatRequest,
+        orgId,
+        reply,
+        isCancelled: () => false,
+        markCancelled: () => {},
+        getAutonomousRuntime,
+        logger: messageLogger,
+    });
+}
+
+async function handleWhatsAppWebhook(
+    request: IncomingMessage,
+    response: ServerResponse,
+    getAutonomousRuntime: (orgId: string) => Promise<AgentRuntime>,
+    requestLogger: ReturnType<typeof createLogger>
+): Promise<void> {
+    const rawBody = await readRawRequestBody(request);
+
+    if (whatsappConfig.appSecret) {
+        if (!isValidWhatsAppSignature(rawBody, request.headers["x-hub-signature-256"])) {
+            requestLogger.warn("Rejected WhatsApp webhook with an invalid signature");
+            response.writeHead(401, { "Content-Type": "application/json" });
+            response.end(JSON.stringify({ error: "Invalid signature." }));
+
+            return;
+        }
+    } else {
+        requestLogger.warn("WHATSAPP_APP_SECRET is not set; skipping WhatsApp webhook signature verification");
+    }
+
+    let payload: unknown;
+
+    try {
+        payload = rawBody.length > 0 ? JSON.parse(rawBody.toString("utf8")) : undefined;
+    } catch (error: unknown) {
+        requestLogger.warn({ err: error }, "Received an unparsable WhatsApp webhook body");
+        response.writeHead(400, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: "Invalid JSON." }));
+
+        return;
+    }
+
+    const inbound = parseWhatsAppInboundMessage(payload);
+
+    if (inbound.kind === "ignore") {
+        requestLogger.debug("Ignoring WhatsApp webhook event without messages");
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ status: "ignored" }));
+
+        return;
+    }
+
+    const messageId = inbound.kind === "text" ? inbound.message.id : inbound.id;
+    const from = inbound.kind === "text" ? inbound.message.from : inbound.from;
+
+    if (!rememberWhatsAppMessageId(messageId)) {
+        requestLogger.info({ messageId }, "Ignoring duplicate WhatsApp message");
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ status: "duplicate" }));
+
+        return;
+    }
+
+    // Meta retries slow webhooks, duplicating bookings, so acknowledge before processing.
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ status: "received" }));
+
+    const messageLogger = requestLogger.child({ channel: "whatsapp", messageId });
+
+    void (async () => {
+        try {
+            if (inbound.kind === "unsupported") {
+                messageLogger.info("Received an unsupported WhatsApp message type");
+                await sendWhatsAppText(from, "I can only handle text messages");
+
+                return;
+            }
+
+            await handleWhatsAppTurn(inbound.message, getAutonomousRuntime, messageLogger);
+        } catch (error: unknown) {
+            messageLogger.error({ err: error }, "Error handling WhatsApp message");
+
+            try {
+                await sendWhatsAppText(from, "Sorry, something went wrong while handling your message.");
+            } catch (sendError: unknown) {
+                messageLogger.error({ err: sendError }, "Failed to send WhatsApp error message");
+            }
+        }
+    })();
+}
+
 async function runAgentServer() {
     const rootRuntime = await createRootAgentRuntime();
-    const autonomousRuntimePromises = new Map<string, Promise<AgentRuntime>>();
+    const autonomousRuntimePromises = new Map<string, Promise<AutonomousRuntimeEntry>>();
     const port = Number(process.env.PORT || process.env.AGENT_PORT || 8791);
     const host = process.env.HOST || "localhost";
 
-    const getAutonomousRuntime = (organizationId: string) => {
-        if (!autonomousRuntimePromises.has(organizationId)) {
-            autonomousRuntimePromises.set(organizationId, createAutonomousAgentRuntime(rootRuntime, organizationId));
+    const startAutonomousRuntime = (organizationId: string) => {
+        const promise = createAutonomousAgentRuntime(rootRuntime, organizationId);
+
+        autonomousRuntimePromises.set(organizationId, promise);
+        promise.catch(() => {
+            // A cached rejection would pin this organization to the same failure until restart.
+            if (autonomousRuntimePromises.get(organizationId) === promise) {
+                autonomousRuntimePromises.delete(organizationId);
+            }
+        });
+
+        return promise;
+    };
+
+    const getAutonomousRuntime = async (organizationId: string): Promise<AgentRuntime> => {
+        const cached = autonomousRuntimePromises.get(organizationId);
+
+        if (cached) {
+            const entry = await cached;
+
+            if (isTokenValid(entry.expiresAt)) {
+                return entry.runtime;
+            }
+
+            // The token has lapsed: drop the runtime and close its client so nothing leaks.
+            if (autonomousRuntimePromises.get(organizationId) === cached) {
+                autonomousRuntimePromises.delete(organizationId);
+                logger.info({ organizationId }, `[org: ${organizationId}] Autonomous runtime token expired - rebuilding`);
+                void entry.runtime.client.close().catch((error: unknown) => {
+                    logger.warn({ organizationId, err: error }, "Failed to close the expired MCP client");
+                });
+            }
         }
 
-        return autonomousRuntimePromises.get(organizationId)!;
+        const entry = await (autonomousRuntimePromises.get(organizationId) ?? startAutonomousRuntime(organizationId));
+
+        return entry.runtime;
     };
 
     const server = createServer(async (request, response) => {
@@ -1427,13 +2135,37 @@ async function runAgentServer() {
         const url = new URL(request.url || "/", `http://${request.headers.host || host}`);
 
         if (url.pathname === "/obo/callback") {
-            await handleOboCallback(url, response, rootRuntime.agentActorToken);
+            const agentActorToken = await rootRuntime.getAgentActorToken().catch((error: unknown) => {
+                requestLogger.error({ err: error }, "Could not obtain an agent actor token for the OBO callback");
+
+                return undefined;
+            });
+
+            await handleOboCallback(url, response, agentActorToken);
 
             return;
         }
 
         if (url.pathname === "/obo/authorize-url") {
             await handleOboAuthorizeUrlRequest(request, response);
+
+            return;
+        }
+
+        if (isWhatsAppEnabled && url.pathname === "/whatsapp/webhook") {
+            if (request.method === "GET") {
+                handleWhatsAppVerification(url, response);
+
+                return;
+            }
+
+            if (request.method === "POST") {
+                await handleWhatsAppWebhook(request, response, getAutonomousRuntime, requestLogger);
+
+                return;
+            }
+
+            writeHttpJson(response, 405, { error: "Method not allowed" });
 
             return;
         }
@@ -1456,6 +2188,7 @@ async function runAgentServer() {
     const handleConnection = (socket: Duplex, authenticatedOrgId: string) => {
         const connectionId = randomUUID();
         const connectionLogger = logger.child({ connectionId });
+        const reply = makeSocketReply(socket);
         let isClosed = false;
 
         connectionLogger.info("WebSocket client connected");
@@ -1514,96 +2247,21 @@ async function runAgentServer() {
                                 ...parsedChatRequest,
                                 orgId: authenticatedOrgId,
                             };
-                            const llmMessages = addContextToFirstUserMessage(
-                                chatRequest.messages,
-                                `Authenticated organization ID for this chat: ${authenticatedOrgId}`
-                            );
                             const messageLogger = connectionLogger.child({
                                 messageCount: chatRequest.messages.length,
                             });
 
-                            if (!sendJson(socket, { type: "processing" })) {
-                                isClosed = true;
-                                return;
-                            }
-
-                            messageLogger.info("Processing chat message");
-
-                            let responseMessage: string;
-                            const permissionTracking: PermissionTrackingContext = {
-                                hasInsufficientPermissions: false,
-                            };
-
-                            try {
-                                const autonomousRuntime = await getAutonomousRuntime(authenticatedOrgId);
-                                const result = await permissionTrackingContext.run(
-                                    permissionTracking,
-                                    () => autonomousRuntime.agent.invoke({ messages: llmMessages })
-                                );
-
-                                responseMessage = getResponseContent(
-                                    result.messages.at(-1)?.content
-                                );
-                            } catch (error) {
-                                if (isInsufficientPermissionsResponse(error)) {
-                                    markInsufficientPermissions();
-                                    permissionTracking.hasInsufficientPermissions = true;
-                                }
-
-                                if (permissionTracking.hasInsufficientPermissions) {
-                                    const { authorizationRequestId } = registerPendingDelegation(
-                                        socket,
-                                        chatRequest,
-                                        undefined,
-                                        delegatedBookingScopes
-                                    );
-
-                                    sendJson(socket, {
-                                        type: "obo_required",
-                                        message: oboRequiredMessage,
-                                        authorizationRequestId,
-                                    });
-                                    messageLogger.info({
-                                        authorizationRequestId,
-                                        toolName: permissionTracking.toolName,
-                                    }, "Delegated authorization required after MCP permission error");
-
-                                    return;
-                                }
-
-                                throw error;
-                            }
-
-                            if (isClosed) {
-                                return;
-                            }
-
-                            if (permissionTracking.hasInsufficientPermissions || isInsufficientPermissionsResponse(responseMessage)) {
-                                const { authorizationRequestId } = registerPendingDelegation(
-                                    socket,
-                                    chatRequest,
-                                    undefined,
-                                    delegatedBookingScopes
-                                );
-
-                                sendJson(socket, {
-                                    type: "obo_required",
-                                    message: oboRequiredMessage,
-                                    authorizationRequestId,
-                                });
-                                messageLogger.info({
-                                    authorizationRequestId,
-                                    toolName: permissionTracking.toolName,
-                                }, "Delegated authorization required after MCP permission response");
-
-                                return;
-                            }
-
-                            sendJson(socket, {
-                                type: "response",
-                                message: responseMessage,
+                            await handleChatTurn({
+                                chatRequest,
+                                orgId: authenticatedOrgId,
+                                reply,
+                                isCancelled: () => isClosed,
+                                markCancelled: () => {
+                                    isClosed = true;
+                                },
+                                getAutonomousRuntime,
+                                logger: messageLogger,
                             });
-                            messageLogger.info({ responseLength: responseMessage.length }, "Chat message processed");
                         }).catch((error: unknown) => {
                             if (isClosed) {
                                 return;
@@ -1693,8 +2351,13 @@ async function runAgentServer() {
         logger.info("Shutting down AI agent");
         server.close();
         for (const autonomousRuntimePromise of autonomousRuntimePromises.values()) {
-            const autonomousRuntime = await autonomousRuntimePromise;
-            await autonomousRuntime.client.close();
+            try {
+                const entry = await autonomousRuntimePromise;
+
+                await entry.runtime.client.close();
+            } catch (error: unknown) {
+                logger.warn({ err: error }, "Failed to close an MCP client during shutdown");
+            }
         }
         process.exit(0);
     };
