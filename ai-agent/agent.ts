@@ -307,6 +307,9 @@ const modelProvider = (getEnv("MODEL_PROVIDER") || "gemini").toLowerCase() as Mo
 const model = createModel();
 
 const agentPrompt = [
+"Your name is Nuvora Assist. When the user only greets you (for example \"Hi\" or \"Hello\"), reply with a short welcome exactly in this style, with no history, policy summaries, or capability lists:",
+"Hi, I'm Nuvora Assist! 👋\n\nI can help you with your day-to-day tasks!\n\nHow can I assist you today? 🤖",
+"The signed-in user's name and email are provided in the context from their ID token. Use them directly; never ask the user for their name or full name, and never ask for details you already have.",
 "You are Wayfinder Enterprise's AI assistant for business travel administrators and employees.",
 "Help users manage business travel in a friendly, clear, and professional way.",
 "You can help with travel policies, employee access, roles, flight options, and bookings.",
@@ -339,6 +342,7 @@ type ChatRequest = {
     mode?: unknown;
     orgId?: unknown;
     orgName?: unknown;
+    idToken?: unknown;
 };
 
 type ChatInvocationMode = "agent" | "user";
@@ -348,6 +352,7 @@ type ParsedChatRequest = {
     mode?: ChatInvocationMode;
     orgId?: string;
     orgName?: string;
+    idToken?: string;
 };
 
 type TravelPolicy = {
@@ -579,6 +584,9 @@ function parseChatRequest(payload: string): ParsedChatRequest {
         const explicitOrgName = typeof request.orgName === "string" && request.orgName.trim()
             ? request.orgName.trim()
             : undefined;
+        const idToken = typeof request.idToken === "string" && request.idToken.trim()
+            ? request.idToken.trim()
+            : undefined;
         const mode = request.mode === "agent" || request.mode === "user"
             ? request.mode
             : undefined;
@@ -591,6 +599,7 @@ function parseChatRequest(payload: string): ParsedChatRequest {
                 mode,
                 orgId,
                 orgName: explicitOrgName,
+                idToken,
             };
         }
 
@@ -614,6 +623,7 @@ function parseChatRequest(payload: string): ParsedChatRequest {
                     mode,
                     orgId,
                     orgName: explicitOrgName,
+                    idToken,
                 };
             }
         }
@@ -680,6 +690,26 @@ function decodeJwtPayload(token: string): Record<string, unknown> | null {
     } catch {
         return null;
     }
+}
+
+function describeUserFromIdToken(idToken?: string): string {
+    const claims = idToken ? decodeJwtPayload(idToken) : null;
+
+    if (!claims) {
+        return "";
+    }
+
+    const text = (key: string) => (typeof claims[key] === "string" ? (claims[key] as string).trim() : "");
+    const firstName = text("given_name");
+    const lastName = text("family_name");
+    const fullName = text("name") || [firstName, lastName].filter(Boolean).join(" ");
+    const details = [
+        fullName && `name: ${fullName}`,
+        firstName && `first name: ${firstName}`,
+        text("email") && `email: ${text("email")}`,
+    ].filter(Boolean);
+
+    return details.length > 0 ? `Signed-in user (from their ID token): ${details.join(", ")}` : "";
 }
 
 function getBearerToken(authorization?: string | string[]) {
@@ -1278,6 +1308,56 @@ async function sendWhatsAppText(to: string, body: string): Promise<void> {
     logger.info({ to, bodyLength: body.length }, "WhatsApp message sent");
 }
 
+// Sends the body with a tappable "Authorize" button instead of a raw URL.
+// Falls back to a plain link if WhatsApp rejects the interactive message.
+async function sendWhatsAppAuthorizeButton(to: string, body: string, url: string): Promise<void> {
+    if (whatsappConfig.dryRun) {
+        logger.info({ to, body, url }, "WhatsApp DRY RUN outbound authorize button");
+
+        return;
+    }
+
+    const response = await fetch(
+        `https://graph.facebook.com/${WHATSAPP_GRAPH_API_VERSION}/${whatsappConfig.phoneNumberId}/messages`,
+        {
+            body: JSON.stringify({
+                messaging_product: "whatsapp",
+                to,
+                type: "interactive",
+                interactive: {
+                    type: "cta_url",
+                    body: { text: body },
+                    action: {
+                        name: "cta_url",
+                        parameters: { display_text: "Authorize", url },
+                    },
+                },
+            }),
+            headers: {
+                "Authorization": `Bearer ${whatsappConfig.token}`,
+                "Content-Type": "application/json",
+            },
+            method: "POST",
+        }
+    );
+
+    if (!response.ok) {
+        const errorBody = await response.text().catch(() => "");
+
+        logger.error({
+            status: response.status,
+            body: errorBody.slice(0, 500),
+            to,
+        }, "Failed to send WhatsApp authorize button; falling back to a plain link");
+
+        await sendWhatsAppText(to, `${body}\n\n${url}`);
+
+        return;
+    }
+
+    logger.info({ to }, "WhatsApp authorize button sent");
+}
+
 // The signature covers the exact bytes Meta sent, which readJsonRequestBody discards.
 async function readRawRequestBody(request: IncomingMessage): Promise<Buffer> {
     const chunks: Buffer[] = [];
@@ -1834,7 +1914,10 @@ async function handleChatTurn(params: {
 
     const llmMessages = addContextToFirstUserMessage(
         chatRequest.messages,
-        `Authenticated organization ID for this chat: ${orgId}`
+        [
+            `Authenticated organization ID for this chat: ${orgId}`,
+            describeUserFromIdToken(chatRequest.idToken),
+        ].filter(Boolean).join("\n")
     );
 
     if (!reply.send({ type: "processing" })) {
@@ -1959,7 +2042,7 @@ async function handleWhatsAppTurn(
 
                 // The link is a one-off, so keep it out of the history the model sees.
                 rememberWhatsAppMessage(from, { role: "assistant", content: text });
-                void sendWhatsAppText(from, `${text}\n\n${authorizeUrl}`);
+                void sendWhatsAppAuthorizeButton(from, text, authorizeUrl);
 
                 return true;
             }

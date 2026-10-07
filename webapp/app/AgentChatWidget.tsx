@@ -269,13 +269,13 @@ function MarkdownMessage({ content }: { content: string }) {
 }
 
 export default function AgentChatWidget() {
-  const { accessToken, isSignedIn, user } = useAuth();
+  const { accessToken, idToken, isSignedIn, user } = useAuth();
   const [isOpen, setIsOpen] = useState(false);
   const [input, setInput] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("disconnected");
   const [messages, setMessages] = useState<ChatMessage[]>(() => [
-    createMessage("assistant", "Hi, I can help with enterprise travel policies, users, roles, and compliant fares."),
+    createMessage("assistant", "Hi, I'm Nuvora Assist! 👋\n\nI can help you with your day-to-day tasks!\n\nHow can I assist you today? 🤖"),
   ]);
   const socketRef = useRef<WebSocket | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -428,6 +428,7 @@ export default function AgentChatWidget() {
     socket.send(JSON.stringify({
       messages: toAgentMessages(nextMessages),
       orgName: user?.orgName || undefined,
+      idToken: idToken || undefined,
     }));
   }
 
