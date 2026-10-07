@@ -275,7 +275,7 @@ export default function AgentChatWidget() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("disconnected");
   const [messages, setMessages] = useState<ChatMessage[]>(() => [
-    createMessage("assistant", "Hi, I'm Nuvora Assist! 👋\n\nI can help you with your day-to-day tasks!\n\nHow can I assist you today? 🤖"),
+    createMessage("assistant", "Hi, I can help with enterprise travel policies, users, roles, and compliant fares."),
   ]);
   const socketRef = useRef<WebSocket | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);

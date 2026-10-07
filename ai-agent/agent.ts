@@ -306,10 +306,14 @@ function createModel() {
 const modelProvider = (getEnv("MODEL_PROVIDER") || "gemini").toLowerCase() as ModelProvider;
 const model = createModel();
 
+// WhatsApp-only: the web chat widget shows its own greeting.
+const whatsappGreetingContext = [
+    "You are Nuvora Assist on WhatsApp. If the user only greets you (for example \"Hi\" or \"Hello\"), reply with a short welcome in exactly this style, with no history, policy summaries, or capability lists:",
+    "Hi, I'm Nuvora Assist! 👋\n\nI can help you with your day-to-day tasks!\n\nHow can I assist you today? 🤖",
+].join("\n");
+
 const agentPrompt = [
-"Your name is Nuvora Assist. When the user only greets you (for example \"Hi\" or \"Hello\"), reply with a short welcome exactly in this style, with no history, policy summaries, or capability lists:",
-"Hi, I'm Nuvora Assist! 👋\n\nI can help you with your day-to-day tasks!\n\nHow can I assist you today? 🤖",
-"The signed-in user's name and email are provided in the context from their ID token. Use them directly; never ask the user for their name or full name, and never ask for details you already have.",
+"If the signed-in user's name or email is provided in the context, use it directly; never ask the user for their name or full name, and never ask for details you already have.",
 "You are Wayfinder Enterprise's AI assistant for business travel administrators and employees.",
 "Help users manage business travel in a friendly, clear, and professional way.",
 "You can help with travel policies, employee access, roles, flight options, and bookings.",
@@ -1909,14 +1913,16 @@ async function handleChatTurn(params: {
     markCancelled: () => void;
     getAutonomousRuntime: (orgId: string) => Promise<AgentRuntime>;
     logger: ReturnType<typeof createLogger>;
+    channel?: "whatsapp";
 }): Promise<void> {
-    const { chatRequest, orgId, reply, isCancelled, markCancelled, getAutonomousRuntime, logger: messageLogger } = params;
+    const { chatRequest, orgId, reply, isCancelled, markCancelled, getAutonomousRuntime, logger: messageLogger, channel } = params;
 
     const llmMessages = addContextToFirstUserMessage(
         chatRequest.messages,
         [
             `Authenticated organization ID for this chat: ${orgId}`,
             describeUserFromIdToken(chatRequest.idToken),
+            channel === "whatsapp" ? whatsappGreetingContext : "",
         ].filter(Boolean).join("\n")
     );
 
@@ -2068,6 +2074,7 @@ async function handleWhatsAppTurn(
         markCancelled: () => {},
         getAutonomousRuntime,
         logger: messageLogger,
+        channel: "whatsapp",
     });
 }
 
